@@ -1,19 +1,19 @@
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
 import torch
 from transformers import CLIPProcessor, CLIPModel
 import os
 import glob
-import pickle # 캐싱을 위한 라이브러리
+import pickle
 
 # --- 설정 ---
 MODEL_NAME = "openai/clip-vit-large-patch14"
 IMAGE_DIR = "assets"
 IMAGE_EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
-TOP_N_RESULTS = 6
-# 모델에 맞춰 새로운 캐시 파일 이름 정의
-CACHE_FILE = "embedding_cache_openai_large.pkl" 
+INITIAL_LOAD = 20  # 처음 로드할 이미지 수
+SCROLL_LOAD = 20   # 스크롤 시 추가 로드할 이미지 수
+CACHE_FILE = "embedding_cache_openai_large.pkl"
 
 # --- GPU 설정 ---
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -33,13 +33,10 @@ except Exception as e:
 # --- [새로운 함수] assets 폴더의 상태를 가져오는 함수 ---
 def get_assets_state(paths):
     """폴더의 현재 상태를 (파일 경로: 최종 수정 시간) 딕셔너리로 반환"""
-    # 순서가 보장된 경로 리스트를 기반으로 상태 생성
     return {path: os.path.getmtime(path) for path in paths if os.path.exists(path)}
 
 # --- 이미지 사전 처리 (캐싱 로직 추가) ---
-# [!!! 추가 해결책 !!!] 경로 구분자를 '/'로 통일하여 시스템 간 불일치 문제 해결
 raw_paths = [p for ext in IMAGE_EXTENSIONS for p in glob.glob(os.path.join(IMAGE_DIR, ext))]
-# Windows의 백슬래시(\)를 포워드슬래시(/)로 변환하고, 알파벳 순으로 정렬합니다.
 image_paths = sorted([p.replace('\\', '/') for p in raw_paths])
 
 image_embeddings = None
@@ -87,7 +84,7 @@ if not cache_valid:
             print(f"💾 새로운 전처리 결과를 캐시 파일({CACHE_FILE})에 저장합니다.")
             new_cache_data = {
                 "state": get_assets_state(image_paths),
-                "paths": image_paths, # 정규화되고 정렬된 경로 저장
+                "paths": image_paths,
                 "embeddings": image_embeddings.cpu()
             }
             with open(CACHE_FILE, "wb") as f:
@@ -102,69 +99,224 @@ if image_embeddings is None or len(image_paths) == 0:
     image_paths, image_embeddings = [], torch.tensor([])
 
 # --- GUI 애플리케이션 ---
-# (이하 코드는 변경할 필요가 없습니다.)
 class ImageSearchApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("CLIP 이미지 검색기")
-        self.root.geometry("800x600")
+        self.root.title("CLIP 이미지 검색기 (v3.0 - Lazy Load & Filter Chain)")
+        self.root.geometry("1000x800")
 
-        # 검색 프레임
-        search_frame = ttk.Frame(root, padding="10")
-        search_frame.pack(fill=tk.X)
-        ttk.Label(search_frame, text="검색어 입력:").pack(side=tk.LEFT, padx=5)
-        self.search_entry = ttk.Entry(search_frame, width=50)
-        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
-        self.search_entry.bind("<Return>", self.search_images)
-        self.search_button = ttk.Button(search_frame, text="🔍 검색", command=self.search_images)
-        self.search_button.pack(side=tk.LEFT, padx=5)
+        # --- 검색 상태 관리 ---
+        self.active_filters = []
+        self.current_image_indices = []
+        self.current_scores = torch.tensor([])
+        self.filter_rows = []
+        self.num_displayed = 0
+        self.is_loading = False
 
-        # 결과 프레임
-        self.result_frame = ttk.Frame(root, padding="10")
-        self.result_frame.pack(fill=tk.BOTH, expand=True)
+        # --- UI 구성 ---
+        # 상단 제어 프레임
+        control_frame = ttk.Frame(root, padding="10")
+        control_frame.pack(fill=tk.X)
 
-    def search_images(self, event=None):
-        if len(image_paths) == 0:
-            print("검색할 이미지가 없습니다.")
-            from tkinter import messagebox
-            messagebox.showinfo("알림", "assets 폴더에 검색할 이미지가 없습니다.")
+        # 필터들을 담을 영역
+        self.filter_area = ttk.Frame(control_frame)
+        self.filter_area.pack(fill=tk.X, expand=True, side=tk.LEFT)
+        
+        # 버튼 영역
+        buttons_frame = ttk.Frame(control_frame)
+        buttons_frame.pack(side=tk.LEFT, padx=(10, 0))
+        self.add_filter_button = ttk.Button(buttons_frame, text="✚ 필터 추가", command=self._apply_and_add_filter)
+        self.add_filter_button.pack(fill=tk.X, pady=2)
+        self.reset_button = ttk.Button(buttons_frame, text="🔄 초기화", command=self.reset_search)
+        self.reset_button.pack(fill=tk.X, pady=2)
+        
+        # 결과 프레임 (스크롤 가능)
+        canvas_frame = ttk.Frame(root, padding=(10, 0, 10, 10))
+        canvas_frame.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(canvas_frame)
+        scrollbar = ttk.Scrollbar(canvas_frame, orient="vertical", command=self.canvas.yview)
+        self.result_frame = ttk.Frame(self.canvas)
+
+        self.result_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.result_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        
+        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # 스크롤 이벤트 바인딩
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind("<Configure>", self._on_scroll)
+
+        # 초기 상태 설정
+        self.reset_search()
+
+    def _add_filter_row(self):
+        # 이전 필터 입력창 비활성화
+        if self.filter_rows:
+            last_entry = self.filter_rows[-1]
+            last_entry.config(state='disabled')
+
+        # 새 필터 입력창 추가
+        row_frame = ttk.Frame(self.filter_area)
+        row_frame.pack(fill=tk.X, pady=2)
+        
+        filter_num = len(self.filter_rows) + 1
+        label = ttk.Label(row_frame, text=f"{filter_num}차 필터:")
+        label.pack(side=tk.LEFT, padx=(0, 5))
+        
+        entry = ttk.Entry(row_frame)
+        entry.pack(fill=tk.X, expand=True)
+        entry.focus()
+        
+        # 첫 필터는 엔터키로 바로 검색 가능하도록
+        if not self.filter_rows:
+            entry.bind("<Return>", lambda e: self._apply_and_add_filter(is_first_filter=True))
+
+        self.filter_rows.append(entry)
+
+    def _apply_and_add_filter(self, is_first_filter=False):
+        if not self.filter_rows: return
+        
+        query = self.filter_rows[-1].get()
+        if not query.strip():
+            messagebox.showinfo("알림", "검색어를 입력하세요.")
             return
 
-        query = self.search_entry.get()
-        if not query:
+        # 검색 실행
+        print(f"\n🔎 {len(self.active_filters)+1}차 필터 적용: '{query}'")
+        self.active_filters.append(query)
+        
+        source_indices = list(range(len(image_paths))) if is_first_filter else self.current_image_indices
+        
+        sorted_indices, sorted_scores = self._perform_search(query, source_indices)
+        
+        if sorted_indices is None:
+            self.active_filters.pop() # 실패 시 필터 원상 복구
             return
 
-        print(f"\n🔎 검색어 '{query}'로 검색을 시작합니다...")
-        for widget in self.result_frame.winfo_children():
+        self.current_image_indices = sorted_indices
+        self.current_scores = sorted_scores
+        
+        # 결과 표시 (지연 로딩 시작)
+        self.display_results(is_new_search=True)
+        
+        # 다음 필터 입력을 위한 행 추가
+        self._add_filter_row()
+
+    def reset_search(self):
+        print("\n🔄 검색 초기화")
+        # 모든 필터 위젯 제거
+        for widget in self.filter_area.winfo_children():
             widget.destroy()
+        
+        # 상태 변수 초기화
+        self.active_filters.clear()
+        self.filter_rows.clear()
+        self.current_image_indices = list(range(len(image_paths))) # 초기엔 모든 이미지
+        self.current_scores = torch.zeros(len(image_paths))
+        
+        # 첫 필터 행 추가
+        self._add_filter_row()
+        
+        # 결과창 초기화
+        self.display_results(is_new_search=True, show_all=True)
 
+    def _perform_search(self, query, source_indices):
+        if not source_indices:
+            messagebox.showinfo("알림", "필터링할 이미지가 없습니다.")
+            return None, None
+
+        subset_embeddings = image_embeddings[source_indices]
         with torch.no_grad():
             text_inputs = processor(text=query, return_tensors="pt").to(device)
             text_embedding = model.get_text_features(**text_inputs)
             text_embedding /= text_embedding.norm(p=2, dim=-1, keepdim=True)
+        
+        similarities = (text_embedding @ subset_embeddings.T).squeeze(0)
+        sorted_subset_indices = similarities.argsort(descending=True)
+        
+        final_sorted_original_indices = [source_indices[i] for i in sorted_subset_indices]
+        sorted_scores = similarities[sorted_subset_indices]
 
-        similarities = (text_embedding @ image_embeddings.T).squeeze(0)
-        top_indices = similarities.argsort(descending=True)[:TOP_N_RESULTS]
+        return final_sorted_original_indices, sorted_scores
+        
+    def display_results(self, is_new_search=False, show_all=False):
+        if self.is_loading: return
+        self.is_loading = True
 
-        print(f"✨ 상위 {len(top_indices)}개 결과:")
-        for i, idx in enumerate(top_indices):
-            path, score = image_paths[idx], similarities[idx].item()
-            print(f"  - {i+1}위: {path} (유사도: {score:.4f})")
+        if is_new_search:
+            for widget in self.result_frame.winfo_children():
+                widget.destroy()
+            self.num_displayed = 0
+            self.canvas.yview_moveto(0)
 
-            img = Image.open(path)
-            img.thumbnail((200, 200))
-            photo = ImageTk.PhotoImage(img)
+        offset = self.num_displayed
+        limit = len(self.current_image_indices) if show_all else offset + (INITIAL_LOAD if is_new_search else SCROLL_LOAD)
+        
+        indices_to_show = self.current_image_indices[offset:limit]
+        if not indices_to_show:
+            if is_new_search: # 새 검색인데 결과가 없는 경우
+                ttk.Label(self.result_frame, text="검색 결과가 없습니다.").pack(pady=20)
+            self.is_loading = False
+            return
+
+        print(f"✨ 결과 표시 중... ( {offset+1} - {offset+len(indices_to_show)} / {len(self.current_image_indices)} )")
+        
+        is_search_result = len(self.active_filters) > 0 and not show_all
+
+        for i, original_idx in enumerate(indices_to_show):
+            path = image_paths[original_idx]
+            try:
+                img = Image.open(path)
+                img.thumbnail((200, 200))
+                photo = ImageTk.PhotoImage(img)
+            except Exception as e:
+                print(f"이미지 로드 오류 '{path}': {e}")
+                continue
 
             item_frame = ttk.Frame(self.result_frame)
             img_label = ttk.Label(item_frame, image=photo)
             img_label.image = photo
             img_label.pack()
-            score_label = ttk.Label(item_frame, text=f"유사도: {score:.3f}")
-            score_label.pack()
-            item_frame.grid(row=i // 3, column=i % 3, padx=10, pady=10)
+
+            if is_search_result:
+                score_idx = self.num_displayed + i
+                score = self.current_scores[score_idx].item()
+                score_label = ttk.Label(item_frame, text=f"유사도: {score:.3f}")
+                score_label.pack()
+
+            grid_idx = self.num_displayed + i
+            item_frame.grid(row=grid_idx // 4, column=grid_idx % 4, padx=5, pady=5)
+
+        self.num_displayed += len(indices_to_show)
+        self.root.update_idletasks()
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self.is_loading = False
+    
+    def _on_scroll(self, event=None):
+        # 스크롤바가 거의 끝에 도달했는지 확인
+        top, bottom = self.canvas.yview()
+        if bottom > 0.9 and not self.is_loading:
+             if self.num_displayed < len(self.current_image_indices):
+                self.display_results()
+
+    def _on_mousewheel(self, event):
+        # Windows/macOS는 event.delta, Linux는 event.num으로 스크롤 방향 감지
+        if event.num == 4: delta = -1 # Linux scroll up
+        elif event.num == 5: delta = 1 # Linux scroll down
+        else: delta = -1 * (event.delta // 120)
+        
+        self.canvas.yview_scroll(delta, "units")
+        self._on_scroll() # 마우스휠 스크롤 후에도 위치 체크
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ImageSearchApp(root)
-    root.mainloop()
+    if not image_paths:
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("오류", f"'{IMAGE_DIR}' 폴더에 이미지가 없습니다.\n프로그램을 종료합니다.")
+    else:
+        root = tk.Tk()
+        app = ImageSearchApp(root)
+        root.mainloop()
 
