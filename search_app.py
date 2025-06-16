@@ -6,9 +6,22 @@ from transformers import CLIPProcessor, CLIPModel
 import os
 import glob
 import pickle
+import subprocess
+import sys
+
+# --- 모델 경로 설정 (exe 배포 환경 대응) ---
+def get_model_path():
+    """exe로 패키징된 경우 임시 경로를, 아닐 경우 로컬 모델 경로를 반환"""
+    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+        # exe로 실행될 때, PyInstaller가 압축을 해제한 임시 폴더 주소
+        return os.path.join(sys._MEIPASS, 'local_clip_model')
+    else:
+        # .py 스크립트로 직접 실행될 때
+        return "./local_clip_model"
 
 # --- 설정 ---
 MODEL_NAME = "openai/clip-vit-large-patch14"
+MODEL_PATH = get_model_path() # 동적으로 모델 경로 결정
 IMAGE_DIR = "assets"
 IMAGE_EXTENSIONS = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
 INITIAL_LOAD = 20  # 처음 로드할 이미지 수
@@ -20,10 +33,16 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"🚀 사용하는 장치: {device.upper()}")
 
 # --- 모델 및 프로세서 로드 ---
-print(f"🤖 '{MODEL_NAME}' 모델과 프로세서를 로드하는 중입니다...")
+print(f"🤖 모델과 프로세서를 로드하는 중입니다...")
 try:
-    model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
-    processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+    if os.path.exists(MODEL_PATH):
+        print(f"   - 로컬 경로에서 로드: '{MODEL_PATH}'")
+        model = CLIPModel.from_pretrained(MODEL_PATH).to(device)
+        processor = CLIPProcessor.from_pretrained(MODEL_PATH)
+    else:
+        print(f"   - 원격에서 다운로드: '{MODEL_NAME}'")
+        model = CLIPModel.from_pretrained(MODEL_NAME).to(device)
+        processor = CLIPProcessor.from_pretrained(MODEL_NAME)
     print("✅ 모델 준비 완료!")
 except Exception as e:
     print(f"🔥 모델 로드 중 오류 발생: {e}")
@@ -109,7 +128,7 @@ class ImageSearchApp:
         self.active_filters = []
         self.current_image_indices = []
         self.current_scores = torch.tensor([])
-        self.filter_rows = []
+        self.active_filter_entry = None # 활성 필터 입력창에 대한 참조
         self.num_displayed = 0
         self.is_loading = False
 
@@ -125,7 +144,7 @@ class ImageSearchApp:
         # 버튼 영역
         buttons_frame = ttk.Frame(control_frame)
         buttons_frame.pack(side=tk.LEFT, padx=(10, 0))
-        self.add_filter_button = ttk.Button(buttons_frame, text="✚ 필터 추가", command=self._apply_and_add_filter)
+        self.add_filter_button = ttk.Button(buttons_frame, text="✚ 필터 추가", command=self._apply_current_filter)
         self.add_filter_button.pack(fill=tk.X, pady=2)
         self.reset_button = ttk.Button(buttons_frame, text="🔄 초기화", command=self.reset_search)
         self.reset_button.pack(fill=tk.X, pady=2)
@@ -151,76 +170,109 @@ class ImageSearchApp:
         # 초기 상태 설정
         self.reset_search()
 
-    def _add_filter_row(self):
-        # 이전 필터 입력창 비활성화
-        if self.filter_rows:
-            last_entry = self.filter_rows[-1]
-            last_entry.config(state='disabled')
+    def _rebuild_filter_ui(self):
+        """현재 self.active_filters를 기반으로 필터 UI 전체를 다시 구성합니다."""
+        for widget in self.filter_area.winfo_children():
+            widget.destroy()
 
-        # 새 필터 입력창 추가
+        # 적용된 필터들을 비활성 상태로 표시
+        for i, query in enumerate(self.active_filters):
+            row_frame = ttk.Frame(self.filter_area)
+            row_frame.pack(fill=tk.X, pady=2)
+            
+            ttk.Label(row_frame, text=f"{i+1}차 필터:").pack(side=tk.LEFT, padx=(0, 5))
+            
+            entry = ttk.Entry(row_frame)
+            entry.insert(0, query)
+            entry.config(state='disabled')
+            entry.pack(fill=tk.X, expand=True, side=tk.LEFT)
+            
+            remove_btn = ttk.Button(row_frame, text="X", width=3, command=lambda i=i: self._remove_filter(i))
+            remove_btn.pack(side=tk.LEFT, padx=(5, 0))
+
+        # 새로운 필터를 입력할 활성 입력창 추가
         row_frame = ttk.Frame(self.filter_area)
         row_frame.pack(fill=tk.X, pady=2)
         
-        filter_num = len(self.filter_rows) + 1
-        label = ttk.Label(row_frame, text=f"{filter_num}차 필터:")
-        label.pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Label(row_frame, text=f"{len(self.active_filters)+1}차 필터:").pack(side=tk.LEFT, padx=(0, 5))
         
-        entry = ttk.Entry(row_frame)
-        entry.pack(fill=tk.X, expand=True)
-        entry.focus()
-        
-        # 첫 필터는 엔터키로 바로 검색 가능하도록
-        if not self.filter_rows:
-            entry.bind("<Return>", lambda e: self._apply_and_add_filter(is_first_filter=True))
+        self.active_filter_entry = ttk.Entry(row_frame)
+        self.active_filter_entry.pack(fill=tk.X, expand=True)
+        self.active_filter_entry.focus()
+        self.active_filter_entry.bind("<Return>", lambda e: self._apply_current_filter())
 
-        self.filter_rows.append(entry)
+    def _rerun_search_chain(self):
+        """필터가 변경될 때마다 전체 검색 체인을 처음부터 다시 실행합니다."""
+        self._rebuild_filter_ui()
 
-    def _apply_and_add_filter(self, is_first_filter=False):
-        if not self.filter_rows: return
-        
-        query = self.filter_rows[-1].get()
+        if not self.active_filters:
+            self.reset_search(is_internal_call=True) # UI만 초기화
+            return
+
+        print("\n🔁 전체 필터 체인을 다시 실행합니다...")
+        source_indices = list(range(len(image_paths)))
+        final_scores = torch.tensor([])
+
+        for i, query in enumerate(self.active_filters):
+            filter_level = i + 1
+            sorted_indices, sorted_scores = self._perform_search(query, source_indices)
+
+            if sorted_indices is None:
+                source_indices, final_scores = [], torch.tensor([])
+                break
+
+            num_previous_results = len(source_indices)
+            limit_ratio = 0
+            if filter_level == 1: limit_ratio = 0.1
+            elif filter_level == 2: limit_ratio = 0.2
+            elif filter_level >= 3: limit_ratio = 0.5
+            
+            if limit_ratio > 0:
+                limit = int(num_previous_results * limit_ratio)
+                if limit == 0 and len(sorted_indices) > 0: limit = 1
+                sorted_indices = sorted_indices[:limit]
+                sorted_scores = sorted_scores[:limit]
+            
+            source_indices = sorted_indices
+            final_scores = sorted_scores
+            print(f"    - {filter_level}차 필터 '{query}' 적용 후: {len(source_indices)}개")
+
+        self.current_image_indices = source_indices
+        self.current_scores = final_scores
+        self.display_results(is_new_search=True)
+
+    def _apply_current_filter(self):
+        """현재 활성 입력창의 검색어를 필터에 추가하고 검색을 다시 실행합니다."""
+        query = self.active_filter_entry.get()
         if not query.strip():
             messagebox.showinfo("알림", "검색어를 입력하세요.")
             return
 
-        # 검색 실행
-        print(f"\n🔎 {len(self.active_filters)+1}차 필터 적용: '{query}'")
+        print(f"\n✚ 필터 추가: '{query}'")
         self.active_filters.append(query)
-        
-        source_indices = list(range(len(image_paths))) if is_first_filter else self.current_image_indices
-        
-        sorted_indices, sorted_scores = self._perform_search(query, source_indices)
-        
-        if sorted_indices is None:
-            self.active_filters.pop() # 실패 시 필터 원상 복구
-            return
+        self._rerun_search_chain()
+    
+    def _remove_filter(self, index_to_remove):
+        """지정된 인덱스의 필터를 제거하고 검색을 다시 실행합니다."""
+        removed_query = self.active_filters.pop(index_to_remove)
+        print(f"\n➖ 필터 제거: '{removed_query}'")
+        self._rerun_search_chain()
 
-        self.current_image_indices = sorted_indices
-        self.current_scores = sorted_scores
+    def reset_search(self, is_internal_call=False):
+        if not is_internal_call:
+            print("\n🔄 검색 초기화")
         
-        # 결과 표시 (지연 로딩 시작)
-        self.display_results(is_new_search=True)
-        
-        # 다음 필터 입력을 위한 행 추가
-        self._add_filter_row()
-
-    def reset_search(self):
-        print("\n🔄 검색 초기화")
-        # 모든 필터 위젯 제거
-        for widget in self.filter_area.winfo_children():
-            widget.destroy()
-        
-        # 상태 변수 초기화
         self.active_filters.clear()
-        self.filter_rows.clear()
-        self.current_image_indices = list(range(len(image_paths))) # 초기엔 모든 이미지
-        self.current_scores = torch.zeros(len(image_paths))
+        self.current_image_indices.clear()
+        self.current_scores = torch.tensor([])
         
-        # 첫 필터 행 추가
-        self._add_filter_row()
+        self._rebuild_filter_ui()
         
-        # 결과창 초기화
-        self.display_results(is_new_search=True, show_all=True)
+        for widget in self.result_frame.winfo_children():
+            widget.destroy()
+        self.num_displayed = 0
+        ttk.Label(self.result_frame, text="상단 검색창에 검색어를 입력하고 '✚ 필터 추가' 버튼을 눌러주세요.").pack(pady=20, padx=10)
+        self.canvas.yview_moveto(0)
 
     def _perform_search(self, query, source_indices):
         if not source_indices:
@@ -276,24 +328,47 @@ class ImageSearchApp:
                 continue
 
             item_frame = ttk.Frame(self.result_frame)
-            img_label = ttk.Label(item_frame, image=photo)
+            img_label = ttk.Label(item_frame, image=photo, cursor="hand2")
             img_label.image = photo
             img_label.pack()
 
             if is_search_result:
                 score_idx = self.num_displayed + i
                 score = self.current_scores[score_idx].item()
-                score_label = ttk.Label(item_frame, text=f"유사도: {score:.3f}")
+                score_label = ttk.Label(item_frame, text=f"유사도: {score:.3f}", cursor="hand2")
                 score_label.pack()
+                # 점수 라벨에도 클릭 이벤트 바인딩
+                score_label.bind("<Button-1>", lambda e, p=path: self._open_image(p))
 
             grid_idx = self.num_displayed + i
             item_frame.grid(row=grid_idx // 4, column=grid_idx % 4, padx=5, pady=5)
+
+            # 프레임과 이미지 라벨에 클릭 이벤트 바인딩
+            item_frame.bind("<Button-1>", lambda e, p=path: self._open_image(p))
+            img_label.bind("<Button-1>", lambda e, p=path: self._open_image(p))
 
         self.num_displayed += len(indices_to_show)
         self.root.update_idletasks()
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.is_loading = False
     
+    def _open_image(self, path):
+        """시스템 기본 뷰어로 이미지 파일 열기"""
+        print(f"🖼️ 이미지 여는 중: {path}")
+        try:
+            # os.startfile은 Windows에서만 작동
+            if sys.platform == "win32":
+                os.startfile(os.path.normpath(path))
+            # macOS는 'open' 명령어 사용
+            elif sys.platform == "darwin":
+                subprocess.run(["open", path], check=True)
+            # Linux 계열은 'xdg-open' 사용
+            else:
+                subprocess.run(["xdg-open", path], check=True)
+        except Exception as e:
+            print(f"🔥 이미지 열기 오류: {e}")
+            messagebox.showerror("오류", f"이미지 파일을 여는 데 실패했습니다:\n{e}")
+
     def _on_scroll(self, event=None):
         # 스크롤바가 거의 끝에 도달했는지 확인
         top, bottom = self.canvas.yview()

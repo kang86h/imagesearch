@@ -1,0 +1,17 @@
+# Local model files
+local_clip_model/
+
+# Virtual environment
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# PyInstaller output
+dist/
+build/
+*.spec
+
+# Embedding cache
+*.pkl 
